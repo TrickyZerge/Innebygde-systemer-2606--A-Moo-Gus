@@ -1,0 +1,530 @@
+A-Moog-Us GUI
+
+GUI for en MIDI-styrt synthesizer som kjører på Raspberry Pi.
+Grensesnittet sender kommandoer til en ESP32 over SPI, og lytter
+samtidig etter MIDI-meldinger inn på Raspberry Pi-ens UART.
+
+Filen er organisert i følgende seksjoner:
+  1. Imports og avhengighetshandtering
+  2. Konstanter
+  3. Klasser
+  4. Hjelpefunksjoner og callbacks
+  5. GUI-oppsett (rotvindu og canvas)
+  6. Instansiering av delte ressurser
+  7. Bygging av grensesnittet (tegning)
+  8. Oppstart
+"""
+
+
+# 1. IMPORTS OG AVHENGIGHETSHANDTERING
+
+
+import tkinter as tk
+import threading
+
+
+DEBUG = True
+
+def debug_print(*args):
+    if DEBUG:
+        print(*args)
+
+
+# pyserial er kun tilgjengelig på maskiner med UART-støtte.
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# spidev er kun tilgjengelig på Raspberry Pi. Uten den kjører
+# programmet med en "fake" SPI som kun skriver ut meldinger.
+try:
+    import spidev
+    SPI_AVAILABLE = True
+except ImportError:
+    spidev = None
+    SPI_AVAILABLE = False
+
+
+
+
+# 2. KONSTANTER
+
+#  SPI-kommandoer til ESP32
+CMD_NOTE_ON = 1   # Command for note on
+CMD_NOTE_OFF = 2  # Command for note off
+CMD_PARAM = 3     # Command for parameter change
+
+#  Bolgeform-definisjoner
+WAVE_SIN = 100
+WAVE_SAW = 101
+WAVE_SQUARE = 102
+PARAM_WAVEFORM = 0
+
+WAVE_NAMES = {
+    WAVE_SIN: "SINE",
+    WAVE_SAW: "SAW",
+    WAVE_SQUARE: "SQUARE"
+}
+
+#  MIDI UART
+MIDI_UART_PORT = "/dev/serial0"
+MIDI_BAUDRATE = 31250
+
+
+
+# 3. KLASSER
+
+
+class ESPTransport:
+    """Handterer SPI-kommunikasjon mot ESP32.
+
+    Faller automatisk tilbake til en "fake" SPI dersom spidev
+    ikke er tilgjengelig, eller SPI-porten ikke kan åpnes.
+    """
+    def __init__(self, use_fake=False):
+        self.use_fake = use_fake or not SPI_AVAILABLE
+        self.spi = None
+        self.lock = threading.Lock()
+
+        if self.use_fake:
+            debug_print("Running with FAKE SPI. Messages will only be printed.")
+            return
+
+        try:
+            self.spi = spidev.SpiDev()
+            self.spi.open(0, 1)
+            self.spi.max_speed_hz = 2_000_000
+            self.spi.mode = 0
+            print("SPI connected to ESP32")
+        except Exception as e:
+            print("Could not open SPI. Falling back to FAKE SPI.")
+            print("Reason:", e)
+            self.use_fake = True
+            self.spi = None
+
+    def send_packet(self, packet):
+        with self.lock:
+            if self.use_fake:
+                debug_print("FAKE SPI SEND:", packet)
+                return
+
+            try:
+                # Catch the response from the ESP32
+                response = self.spi.xfer2(packet)
+
+                # Format the response as Hex for easy reading
+                hex_response = [hex(b) for b in response]
+                debug_print(f"--> SPI SENT: {packet} | ESP32 RETURNED: {hex_response}")
+
+            except Exception as e:
+                debug_print("SPI error:", e)
+
+    def note_on(self, note, velocity):
+        note = int(note) & 0x7F
+        velocity = int(velocity) & 0x7F
+        checksum = (CMD_NOTE_ON + note + velocity) & 0xFF
+        self.send_packet([CMD_NOTE_ON, note, velocity, checksum])
+
+    def note_off(self, note):
+        note = int(note) & 0x7F
+        checksum = (CMD_NOTE_OFF + note) & 0xFF
+        self.send_packet([CMD_NOTE_OFF, note, 0, checksum])
+
+    def param(self, param_id, value):
+        param_id = int(param_id) & 0x7F
+        value = int(value) & 0xFF
+        checksum = (CMD_PARAM + param_id + value) & 0xFF
+        self.send_packet([CMD_PARAM, param_id, value, checksum])
+
+
+
+# 4. HJELPEFUNKSJONER OG CALLBACKS
+
+
+#  Tegne-hjelper GUI
+def rounded_rect(canvas, x1, y1, x2, y2, r=20, **kwargs):
+    points = [
+        x1+r, y1,
+        x1+r, y1,
+        x2-r, y1,
+        x2-r, y1,
+        x2, y1,
+        x2, y1+r,
+        x2, y1+r,
+        x2, y2-r,
+        x2, y2-r,
+        x2, y2,
+        x2-r, y2,
+        x2-r, y2,
+        x1+r, y2,
+        x1+r, y2,
+        x1, y2,
+        x1, y2-r,
+        x1, y2-r,
+        x1, y1+r,
+        x1, y1+r,
+        x1, y1
+    ]
+    return canvas.create_polygon(points, smooth=True, **kwargs)
+
+
+#  Farge-funksjoner for tangenter
+def press_key(midi_note):
+    if midi_note in midi_note_to_key:
+        key_data = midi_note_to_key[midi_note]
+        canvas.itemconfig(key_data["id"], fill=key_data["pressed_color"])
+
+def release_key(midi_note):
+    if midi_note in midi_note_to_key:
+        key_data = midi_note_to_key[midi_note]
+        canvas.itemconfig(key_data["id"], fill=key_data["normal_color"])
+
+
+#  Callbacks for pads
+def on_pad_click(event, pad_num):
+    debug_print(f"Pad {pad_num} pressed")
+
+
+#  Callbacks for tangenter
+def on_key_press(event, midi_note):
+    debug_print(f"GUI key pressed: {midi_note}")
+    press_key(midi_note)
+    esp.note_on(midi_note, 100)
+
+def on_key_release(event, midi_note):
+    debug_print(f"GUI key released: {midi_note}")
+    release_key(midi_note)
+    esp.note_off(midi_note)
+
+
+#  Callback for valg av bolgeform
+def select_wave(wave):
+    global current_wave
+    current_wave = wave
+    debug_print(f"Waveform set to {WAVE_NAMES[wave]}")
+    esp.param(PARAM_WAVEFORM, wave)
+
+
+#  MIDI UART-handtering
+def handle_midi_message(status, data1, data2):
+    """
+    Tolker en komplett 3-byte MIDI-melding.
+    status = statusbyte, f.eks. 0x90 for note_on
+    data1 = note/waveform
+    data2 = velocity
+    """
+
+    message_type = status & 0xF0
+    channel = status & 0x0F
+
+    # Note On
+    if message_type == 0x90 and data2 > 0:
+        note = data1
+        velocity = data2
+
+        debug_print(f"NOTE ON  note={note}, velocity={velocity}, channel={channel + 1}")
+
+        esp.note_on(note, velocity)
+        root.after(0, release_key, note)
+
+    # Note Off
+    elif message_type == 0x80 or (message_type == 0x90 and data2 == 0):
+        note = data1
+
+        debug_print(f"NOTE OFF note={note}, channel={channel + 1}")
+
+        esp.note_off(note)
+        root.after(0, release_key, note)
+
+
+def midi_listener():
+    """
+    Leser MIDI direkte fra Raspberry Pi UART.
+    Brukes nar MIDI DIN gar via optocoupler inn pa RPI RX.
+    """
+
+    if serial is None:
+        debug_print("pyserial is not installed. UART MIDI cannot be used on this machine.")
+        return
+
+    try:
+        midi_serial = serial.Serial(
+            port=MIDI_UART_PORT,
+            baudrate=MIDI_BAUDRATE,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.01
+        )
+
+        debug_print(f"Listening for MIDI on {MIDI_UART_PORT} at {MIDI_BAUDRATE} baud")
+
+    except serial.SerialException as e:
+        debug_print("Could not open MIDI UART:", e)
+        return
+
+    running_status = None
+    data_bytes = []
+
+    while True:
+        raw_byte = midi_serial.read(1)
+
+        if not raw_byte:
+            continue
+        byte = raw_byte[0]
+
+        # System Real-Time (0xF8-0xFF): kan komme når som helst,
+        # avbryter IKKE running status, har ingen databytes. Ignorer.
+        if byte >= 0xF8:
+            continue
+
+        # System Common (0xF0-0xF7): nullstiller running status
+        if 0xF0 <= byte <= 0xF7:
+            running_status = None
+            data_bytes = []
+            continue
+
+        # Kanal-statusbyte: 0x80 - 0xEF (note on/off, CC, osv.)
+        if byte & 0x80:
+            running_status = byte
+            data_bytes = []
+            continue
+
+        # Databyte: 0x00 - 0x7F
+        if running_status is None:
+            continue
+
+        data_bytes.append(byte)
+        message_type = running_status & 0xF0
+
+        if message_type in (0x80, 0x90) and len(data_bytes) >= 2:
+            handle_midi_message(running_status, data_bytes[0], data_bytes[1])
+            data_bytes = []   # running_status beholdes for neste melding
+
+
+
+# 5. GUI-OPPSETT (Hovedvindu og canvas)
+
+
+root = tk.Tk()
+root.title("A-Moog-Us GUI")
+root.geometry("1000x350")
+root.configure(bg="#0f0d0d")
+
+canvas = tk.Canvas(root, width=1000, height=350, bg="#850000", highlightthickness=0)
+canvas.pack()
+
+
+
+# 6. INSTANSIERING AV DELTE RESSURSER
+
+
+#  SPI-transport mot ESP32
+esp = ESPTransport(use_fake=False)
+
+#  Programtilstand (Starter alltid med SIN)
+current_wave = WAVE_SIN
+
+#  Oppslag fra MIDI-note til tilhørende tangent på canvas
+midi_note_to_key = {}
+
+#  Logo
+logo_image = tk.PhotoImage(file="A-Moog-Us.png")
+logo_image = logo_image.subsample(6, 6)  # halverer størrelse på bildet
+
+
+
+# 7. Bygging av GUI deler (pads, knobs og tangenter)
+
+
+#  Hovedbody
+rounded_rect(canvas, 20, 20, 980, 330, r=25, fill="#d70e06", outline="#444", width=2)
+
+#  Pads
+pad_x_start = 50
+pad_y_start = 55
+pad_size = 45
+pad_gap = 12
+
+pad_num = 1
+for row in range(2):
+    for col in range(4):
+        x1 = pad_x_start + col * (pad_size + pad_gap)
+        y1 = pad_y_start + row * (pad_size + pad_gap)
+        x2 = x1 + pad_size
+        y2 = y1 + pad_size
+
+        pad = rounded_rect(canvas, x1, y1, x2, y2, r=8, fill="#3f3f3f", outline="#666", width=2)
+        canvas.create_text((x1+x2)/2, (y1+y2)/2, text=str(pad_num), fill="white", font=("Arial", 10, "bold"))
+        canvas.tag_bind(pad, "<Button-1>", lambda e, n=pad_num: on_pad_click(e, n))
+        pad_num += 1
+
+
+#  Knotter
+knob_x_start = 425
+knob_y = 70
+knob_radius = 18
+knob_gap = 70
+
+for i in range(3):
+    cx = knob_x_start + i * knob_gap
+    cy = knob_y
+    canvas.create_oval(cx-knob_radius, cy-knob_radius, cx+knob_radius, cy+knob_radius,
+                       fill="#555", outline="#888", width=2)
+    # liten indikatorstrek
+    canvas.create_line(cx, cy, cx, cy-knob_radius+5, fill="white", width=2)
+
+
+#  Mini kontroller tekstboks
+canvas.create_rectangle(60, 185, 220, 220, fill="#FFFFFF", outline="#666", width=2)
+canvas.create_text(140, 202, text="Mini Controller", fill="#000000", font=("Courier", 12, "bold"))
+
+
+#  GUI-knapper for wave type
+btn_sine = tk.Button(
+    root,
+    text="SINE",
+    width=10,
+    command=lambda: select_wave(WAVE_SIN)
+)
+
+btn_saw = tk.Button(
+    root,
+    text="SAW",
+    width=10,
+    command=lambda: select_wave(WAVE_SAW)
+)
+
+btn_square = tk.Button(
+    root,
+    text="SQUARE",
+    width=10,
+    command=lambda: select_wave(WAVE_SQUARE)
+)
+
+btn_sine.place(x=371, y=110)
+btn_saw.place(x=456, y=110)
+btn_square.place(x=541, y=110)
+
+
+#  Logo A-Moog-Us
+canvas.create_image(
+    750, 70,
+    image=logo_image,
+    anchor="nw"
+)
+
+#  Label
+canvas.create_text(870, 45, text="A-MOOG-US", fill="white", font=("Arial", 14, "bold"))
+
+
+#  Hvite tangenter
+white_key_width = 26
+white_key_height = 120
+white_key_y = 180
+white_key_x_start = 300
+
+# 15 tangenter
+white_notes = [
+    "C", "D", "E", "F", "G", "A", "B",
+    "C", "D", "E", "F", "G", "A", "B",
+    "C"
+]
+
+white_key_ids = []
+
+white_midi_notes = [
+    48, 50, 52, 53, 55, 57, 59,
+    60, 62, 64, 65, 67, 69, 71,
+    72
+]
+
+for i, note in enumerate(white_notes):
+    midi_note = white_midi_notes[i]
+
+    x1 = white_key_x_start + i * white_key_width
+    y1 = white_key_y
+    x2 = x1 + white_key_width
+    y2 = y1 + white_key_height
+
+    key = canvas.create_rectangle(
+        x1, y1, x2, y2,
+        fill="#f5f5f5", outline="black", width=1
+    )
+
+    white_key_ids.append((key, note))
+
+    midi_note_to_key[midi_note] = {
+        "id": key,
+        "normal_color": "#fdfdfd",
+        "pressed_color": "#86F83A"
+    }
+
+    canvas.tag_bind(key, "<ButtonPress-1>", lambda e, n=midi_note: on_key_press(e, n))
+    canvas.tag_bind(key, "<ButtonRelease-1>", lambda e, n=midi_note: on_key_release(e, n))
+
+
+#  Svarte tangenter
+# monster per oktav: C#, D#, (ingen mellom E-F), F#, G#, A#, (ingen mellom B-C)
+black_pattern = [
+    (0, "C#", 49),
+    (1, "D#", 51),
+    (3, "F#", 54),
+    (4, "G#", 56),
+    (5, "A#", 58)
+]
+# posisjoner mellom hvite keys i en 7-tonersgruppe
+
+black_key_width = 16
+black_key_height = 75
+
+for octave in range(3):
+    base_index = octave * 7
+
+    for offset, note_name, midi_note in black_pattern:
+        white_index = base_index + offset
+        full_midi_note = midi_note + octave * 12
+
+        if white_index + 1 >= len(white_notes):
+            continue
+
+        x1 = white_key_x_start + (white_index + 1) * white_key_width - black_key_width / 2
+        y1 = white_key_y
+        x2 = x1 + black_key_width
+        y2 = y1 + black_key_height
+
+        black_key = canvas.create_rectangle(
+            x1, y1, x2, y2,
+            fill="black", outline="#222", width=1
+        )
+
+        midi_note_to_key[full_midi_note] = {
+            "id": black_key,
+            "normal_color": "black",
+            "pressed_color": "#86F83A"
+        }
+
+        canvas.tag_bind(
+        black_key,
+        "<ButtonPress-1>",
+        lambda e, n=full_midi_note: on_key_press(e, n)
+)
+
+        canvas.tag_bind(
+        black_key,
+        "<ButtonRelease-1>",
+        lambda e, n=full_midi_note: on_key_release(e, n)
+)
+
+
+
+# 8. OPPSTART
+
+
+#  Start MIDI-lytter i egen trad
+midi_thread = threading.Thread(target=midi_listener, daemon=True)
+midi_thread.start()
+
+#  Start GUI
+root.mainloop()
