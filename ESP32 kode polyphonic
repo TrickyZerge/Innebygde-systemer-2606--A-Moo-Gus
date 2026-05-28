@@ -139,9 +139,9 @@ void spiListenerTask(void *pvParameters) {
   }
 }
 
-// ==========================================================
+
 // SETUP & CORE 1 AUDIO LOOP
-// ==========================================================
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
