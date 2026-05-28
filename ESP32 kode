@@ -1,0 +1,209 @@
+#include <Arduino.h>
+#include <driver/spi_slave.h>
+#include <math.h>
+#include <atomic>
+#include "AudioTools.h"
+
+// --- SPI PIN ROUTING ---
+#define PIN_NUM_MOSI 11 
+#define PIN_NUM_MISO 12 
+#define PIN_NUM_CLK  13 
+#define PIN_NUM_CS   15  
+
+// --- I2S DAC ROUTING ---
+#define PIN_I2S_BCLK 8
+#define PIN_I2S_WS   40
+#define PIN_I2S_DOUT 41
+
+// --- PROTOCOL IDs ---
+#define CMD_NOTE_ON  1
+#define CMD_NOTE_OFF 2
+#define CMD_PARAM    3
+
+// --- WAVEFORM IDs 
+#define WAVE_SIN     100
+#define WAVE_SAW     101
+#define WAVE_SQUARE  102
+
+// --- PARAM IDs 
+#define PARAM_WAVEFORM 0
+
+// --- DMA BUFFERS ---
+WORD_ALIGNED_ATTR uint8_t rx_buf[4] = {0};
+WORD_ALIGNED_ATTR uint8_t tx_buf[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+
+// --- AUDIO TOOLS OBJECTS ---
+AudioInfo info(44100, 2, 16);
+
+// Vi definerer alle tre oscillatorene
+SineWaveGenerator<int16_t> sineWave(32000);
+SawToothGenerator<int16_t> sawWave(32000);            
+SquareWaveGenerator<int16_t> squareWave(32000);
+
+// Vi lager en separat lydstrøm for hver oscillator
+GeneratedSoundStream<int16_t> soundSine(sineWave);
+GeneratedSoundStream<int16_t> soundSaw(sawWave);          
+GeneratedSoundStream<int16_t> soundSquare(squareWave); 
+
+I2SStream out; 
+
+// Initialiserer kopimaskinen med Sine som standard
+StreamCopy copier(out, soundSine, 2048);                  
+
+// --- THREAD-SAFE VARIABLES (Core 0 -> Core 1) ---
+std::atomic<float> current_frequency(0.0f);
+std::atomic<int16_t> current_amplitude(0);
+std::atomic<int> current_wave_type(WAVE_SIN); // Standard start-bølge
+
+
+// ==========================================================
+// CORE 0: SPI LISTENER TASK
+// ==========================================================
+void spiListenerTask(void *pvParameters) {
+
+  // 1. Configure SPI Bus
+  spi_bus_config_t buscfg = {};
+  buscfg.mosi_io_num = PIN_NUM_MOSI;
+  buscfg.miso_io_num = PIN_NUM_MISO;
+  buscfg.sclk_io_num = PIN_NUM_CLK;
+  buscfg.quadwp_io_num = -1;
+  buscfg.quadhd_io_num = -1;
+
+  spi_slave_interface_config_t slvcfg = {};
+  slvcfg.mode = 0;
+  slvcfg.spics_io_num = PIN_NUM_CS;
+  slvcfg.queue_size = 3;
+  slvcfg.flags = 0;
+
+  spi_slave_initialize(SPI2_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+  Serial.println("Core 0: SPI Listener Ready.");
+
+  // 2. Infinite Listener Loop
+  while (true) {
+    memset(rx_buf, 0, 4);
+
+    spi_slave_transaction_t t = {};
+    t.length = 4 * 8;
+    t.tx_buffer = tx_buf;
+    t.rx_buffer = rx_buf;
+
+    esp_err_t ret = spi_slave_transmit(SPI2_HOST, &t, portMAX_DELAY);
+
+    if (ret == ESP_OK) {
+      uint8_t cmd   = rx_buf[0];
+      uint8_t data1 = rx_buf[1];
+      uint8_t data2 = rx_buf[2];
+      uint8_t crc   = rx_buf[3];
+
+      if (crc == ((cmd + data1 + data2) & 0xFF)) {
+
+        // Prepare Success ACK
+        tx_buf[0] = 0x99;
+        tx_buf[1] = cmd;
+        tx_buf[2] = data1;
+        tx_buf[3] = 0x00;
+
+        // Execute Command
+        if (cmd == CMD_NOTE_ON) {
+          // Frequency: f = 440 * 2^((note - 69) / 12)
+          float freq = 440.0 * pow(2.0, (data1 - 69.0) / 12.0);
+
+          // Map Velocity (0-127) to 16-bit Audio Amplitude (0-32000)
+          int16_t amp = map(data2, 0, 127, 0, 32000);
+
+          current_frequency = freq;
+          current_amplitude = amp;
+
+          Serial.printf("Note ON: %d | Freq: %.2f Hz | Vel: %d\n", data1, freq, data2);
+        }
+        else if (cmd == CMD_NOTE_OFF) {
+          current_amplitude = 0; // Mute the synth
+          Serial.printf("Note OFF: %d\n", data1);
+        }
+        else if (cmd == CMD_PARAM) {
+          if (data1 == PARAM_WAVEFORM) {
+            // data2 er bølgeform-verdien: 100, 101 eller 102
+            current_wave_type = data2;
+            Serial.printf("Waveform Changed to: %d\n", data2);
+          }
+        }
+      }
+      else {
+        // Checksum Error
+        tx_buf[0] = 0xEE;
+        tx_buf[1] = 0x00;
+        tx_buf[2] = 0x00;
+        tx_buf[3] = 0x00;
+      }
+    }
+  }
+}
+
+// ==========================================================
+// SETUP & CORE 1 AUDIO LOOP
+// ==========================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  AudioToolsLogger.begin(Serial, AudioToolsLogLevel::Warning);
+
+  // 1. Start the SPI Listener Task on Core 0
+  xTaskCreatePinnedToCore(spiListenerTask, "SPI_Task", 4096, NULL, 1, NULL, 0);
+
+  // 2. Configure I2S for the DAC
+  Serial.println("Core 1: Starting I2S Audio Engine...");
+  auto config = out.defaultConfig(TX_MODE);
+  config.copyFrom(info); 
+
+  config.pin_bck = PIN_I2S_BCLK;
+  config.pin_ws  = PIN_I2S_WS;
+  config.pin_data = PIN_I2S_DOUT;
+
+  config.buffer_count = 16;  
+  config.buffer_size = 1024; 
+  out.begin(config);
+
+  // 3. Start Alle Synther Muted
+  sineWave.begin(info, 0);
+  sineWave.setAmplitude(0);
+  
+  sawWave.begin(info, 0);
+  sawWave.setAmplitude(0);
+
+  squareWave.begin(info, 0);
+  squareWave.setAmplitude(0);
+  
+  Serial.println("Synthesizer Boot Complete. Ready for MIDI.");
+}
+
+void loop() {
+  static int last_wave_type = WAVE_SIN;
+
+  // 1. Oppdater frekvens og amplitude på ALLE generatorene samtidig
+  // Dette gjør at overgangen blir sømløs når man bytter mellom dem
+  sineWave.setFrequency(current_frequency);
+  sineWave.setAmplitude(current_amplitude);
+  
+  sawWave.setFrequency(current_frequency);
+  sawWave.setAmplitude(current_amplitude);
+  
+  squareWave.setFrequency(current_frequency);
+  squareWave.setAmplitude(current_amplitude);
+
+  // 2. Sjekk om RPi har bedt om å bytte bølgeform
+  if (current_wave_type != last_wave_type) {
+    last_wave_type = current_wave_type;
+    
+    // Bytt ut hvilken stream "copier" henter data fra
+    if (last_wave_type == WAVE_SIN) {
+      copier.begin(out, soundSine);
+    } else if (last_wave_type == WAVE_SAW) {
+      copier.begin(out, soundSaw);
+    } else if (last_wave_type == WAVE_SQUARE) {
+      copier.begin(out, soundSquare);
+    }
+  }
+
+  // 3. Pump lyden ut til DAC-en
+  copier.copy();
+}
